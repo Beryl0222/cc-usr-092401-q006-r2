@@ -44,6 +44,13 @@ def make_handler(service: HeritageCitrusService):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_error(self, exc: DomainError) -> None:
+            payload = {"error": exc.code, "message": exc.message}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._send(exc.status, payload)
+
         def _read_json(self) -> dict:
             length = int(self.headers.get("Content-Length") or 0)
             if not length:
@@ -71,8 +78,8 @@ def make_handler(service: HeritageCitrusService):
                 if path == "/health":
                     self._send(200, health_payload())
                     return
-                known = (path == "/batches" or path == "/trace"
-                         or path.startswith(("/batches/", "/trees/",
+                known = (path == "/batches" or path == "/trace" or path == "/conflicts"
+                         or path.startswith(("/batches/", "/trees/", "/conflicts/",
                                              "/settlements/", "/ledgers/")))
                 if not known:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
@@ -82,6 +89,11 @@ def make_handler(service: HeritageCitrusService):
 
                 if path == "/batches":
                     self._send(200, {"记录": self.svc.list_batches(actor)})
+                elif path == "/conflicts":
+                    status = qs.get("状态", [None])[0]
+                    self._send(200, {"记录": self.svc.list_conflicts(actor, status)})
+                elif path.startswith("/conflicts/"):
+                    self._send(200, self.svc.get_conflict(actor, path.split("/")[2]))
                 elif path.startswith("/batches/"):
                     self._send(200, self.svc.get_batch_detail(actor, path.split("/")[2]))
                 elif path.startswith("/trees/"):
@@ -101,7 +113,7 @@ def make_handler(service: HeritageCitrusService):
                 else:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
             except DomainError as exc:
-                self._send(exc.status, {"error": exc.code, "message": exc.message})
+                self._send_error(exc)
 
         def do_POST(self):
             parsed = urlparse(self.path)
@@ -121,6 +133,7 @@ def make_handler(service: HeritageCitrusService):
                     "/batches", "/reservations", "/weigh", "/inspections", "/reviews",
                     "/price-rules", "/contracts", "/deliveries", "/settlements",
                     "/returns", "/losses", "/processing", "/reports",
+                    "/conflicts/resolve",
                 }
                 if path not in known_post:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
@@ -153,11 +166,13 @@ def make_handler(service: HeritageCitrusService):
                     self._send(201, svc.reserve_trees(
                         actor, data["批次编号"], data["树群编号"], data["重量kg"]))
                 elif path == "/weigh":
-                    self._send(201, svc.weigh(
+                    ticket = svc.weigh(
                         actor, data["批次编号"], data["树群编号"], data["过磅流水号"],
                         weight_kg=data.get("重量kg"), gross_kg=data.get("毛重kg"),
                         tare_kg=data.get("皮重kg"), offline=bool(data.get("断网离线", False)),
-                        device=data.get("设备号", ""), at=data.get("过磅时间")))
+                        device=data.get("设备号", ""), at=data.get("过磅时间"))
+                    # 新建磅单 201；同摘要重放 200（幂等命中），接口语义上区分于首次创建
+                    self._send(200 if ticket.get("幂等命中") else 201, ticket)
                 elif path == "/inspections":
                     self._send(201, svc.inspect(
                         actor, data["磅单编号"], data["等级"], data["判定依据"],
@@ -197,13 +212,17 @@ def make_handler(service: HeritageCitrusService):
                 elif path == "/reports":
                     self._send(201, svc.report_tree_issue(
                         actor, data["树群编号"], data["类型"], data["描述"]))
+                elif path == "/conflicts/resolve":
+                    self._send(200, svc.resolve_conflict(
+                        actor, data["冲突编号"], data["裁定"],
+                        data.get("裁定理由", "")))
                 else:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
             except KeyError as exc:
                 self._send(422, {"error": "validation_failed",
                                  "message": f"缺少必填字段：{exc.args[0]}"})
             except DomainError as exc:
-                self._send(exc.status, {"error": exc.code, "message": exc.message})
+                self._send_error(exc)
 
     return Handler
 

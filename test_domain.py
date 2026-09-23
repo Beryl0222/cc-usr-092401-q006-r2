@@ -572,5 +572,413 @@ class TraceabilityTest(unittest.TestCase):
         self.assertEqual(chain["地块"]["地块编号"], w.plot_id)
 
 
+class WeighConflictAuditTest(unittest.TestCase):
+    """磅单幂等可审计：稳定摘要、重放/冲突分流、待复核、更正与差异调整。"""
+
+    def setUp(self):
+        self.w = World()
+        svc = self.w.svc
+        # 第二片普通老树，用于"补传把树群改掉"的更正场景
+        self.other_tree = svc.register_tree_group(
+            self.w.coop, self.w.plot_id, "坡顶老红橘", "红橘", 55, "普通老树")
+        self.other_tree_id = self.other_tree["编号"]
+        self.batch = svc.open_batch(self.w.coop, self.w.plot_id, "2026-09-01", "2026秋")
+        self.bid = self.batch["批次编号"]
+
+    def _conflict_of(self, slip_call):
+        """执行一次必然冲突的补传，返回 Conflict。"""
+        with self.assertRaises(Conflict) as cm:
+            slip_call()
+        self.assertEqual(cm.exception.code, "weigh_conflict")
+        return cm.exception
+
+    # ------------------------------------------------------------ 摘要与重放
+
+    def test_identical_resend_is_replay_with_stable_digest(self):
+        svc = self.w.svc
+        first = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W1",
+                          gross_kg="210", tare_kg="10", offline=True, device="地磅-02")
+        digest = first["业务摘要"]
+        # 数值尾零等价（210 与 210.0）、断网标记变化都不影响业务摘要
+        replay = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W1",
+                           gross_kg="210.0", tare_kg="10.0", offline=False,
+                           device="地磅-02")
+        self.assertTrue(replay["幂等命中"])
+        self.assertEqual(replay["磅单编号"], first["磅单编号"])
+        self.assertEqual(replay["业务摘要"], digest)
+        self.assertEqual(len(svc.get_batch_detail(self.w.coop, self.bid)["磅单"]), 1)
+
+    def test_explicit_time_change_is_a_real_conflict(self):
+        svc = self.w.svc
+        svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W2",
+                  weight_kg="100", device="D", at="2026-09-01T08:00:00+00:00")
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "W2",
+            weight_kg="100", device="D", at="2026-09-01T09:30:00+00:00"))
+        self.assertEqual(exc.details["差异字段"], ["过磅时间"])
+
+    # ------------------------------------------------------------ 冲突保留原单
+
+    def test_key_field_change_keeps_original_and_opens_conflict(self):
+        svc = self.w.svc
+        first = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W3",
+                          weight_kg="100", device="D1")
+        first_tree_weight = svc.get_tree_group(self.w.coop, self.w.old_tree_id)["本季已采重量kg"]
+        insp_id = svc.inspect(self.w.reviewer, first["磅单编号"], "A", "达标")["检验编号"]
+
+        # 人工补录把净重改成 120
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "W3",
+            weight_kg="120", device="D1"))
+        self.assertIn("净重kg", exc.details["差异字段"])
+        cid = exc.details["冲突编号"]
+
+        # 原磅单、树群已采重量、检验一律不变
+        det = svc.get_batch_detail(self.w.coop, self.bid)
+        self.assertEqual(len(det["磅单"]), 1)
+        self.assertEqual(det["磅单"][0]["重量kg"], "100")
+        self.assertEqual(det["磅单"][0]["检验编号"], insp_id)
+        self.assertEqual(svc.get_tree_group(self.w.coop, self.w.old_tree_id)["本季已采重量kg"],
+                         first_tree_weight)
+        # 冲突可审计：待复核，双方摘要与差异字段都在
+        conflict = svc.get_conflict(self.w.coop, cid)
+        self.assertEqual(conflict["状态"], "待复核")
+        self.assertEqual(conflict["原净重kg"], "100")
+        self.assertEqual(conflict["补传净重kg"], "120")
+        # 同一条错误补传反复重推：冲突只登记一次
+        self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "W3", weight_kg="120", device="D1"))
+        self.assertEqual(len([c for c in svc.list_conflicts(self.w.coop)
+                              if c["原磅单编号"] == first["磅单编号"]]), 1)
+
+    def test_tree_group_change_is_conflict_without_touching_quota(self):
+        svc = self.w.svc
+        svc.reserve_trees(self.w.coop, self.bid, self.w.heritage_id, "50")
+        svc.weigh(self.w.coop, self.bid, self.w.heritage_id, "W4", weight_kg="50")
+        reserved_tree_weight = svc.get_tree_group(
+            self.w.coop, self.w.heritage_id)["本季已采重量kg"]
+        # 补传把树群改成另一片（且净重不同）：原保护树已采重量不动
+        self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.other_tree_id, "W4", weight_kg="55"))
+        self.assertEqual(svc.get_tree_group(
+            self.w.coop, self.w.heritage_id)["本季已采重量kg"], reserved_tree_weight)
+        self.assertEqual(svc.get_tree_group(
+            self.w.coop, self.other_tree_id)["本季已采重量kg"], "0")
+
+    def test_failed_submission_does_not_consume_slip_number(self):
+        svc = self.w.svc
+        svc.reserve_trees(self.w.coop, self.bid, self.w.heritage_id, "50")
+        # 超预占被拒
+        with self.assertRaises(Conflict) as cm:
+            svc.weigh(self.w.coop, self.bid, self.w.heritage_id, "W5", weight_kg="51")
+        self.assertEqual(cm.exception.code, "over_reservation")
+        # 非法净重被拒
+        with self.assertRaises(ValidationFailed):
+            svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W6", weight_kg="-1")
+        # 同流水号随后合法提交成功（不是幂等命中），证明失败不占号
+        t = svc.weigh(self.w.coop, self.bid, self.w.heritage_id, "W5", weight_kg="50")
+        self.assertNotIn("幂等命中", t)
+        t2 = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W6", weight_kg="5")
+        self.assertNotIn("幂等命中", t2)
+
+    # ------------------------------------------------------------ 重启式重放
+
+    def test_restart_replay_after_delivery_still_recognized(self):
+        svc = self.w.svc
+        ticket, _ = weigh_inspect_settle(self.w, self.bid, self.w.old_tree_id, "W7", "10", "A")
+        svc.deliver(self.w.coop, self.bid, "广兴饮料厂", self.w.contract_id,
+                    "2026-09-02T08:00:00+00:00")
+        # 设备重启后重推旧单：识别为重放，不报 batch_delivered
+        replay = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W7",
+                           weight_kg="10", device="地磅-01")
+        self.assertTrue(replay["幂等命中"])
+        self.assertEqual(replay["磅单编号"], ticket["磅单编号"])
+        # 交货后内容不一致仍是冲突（留痕），不是直接拒绝
+        self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "W7", weight_kg="11", device="地磅-01"))
+        # 交货后全新流水号不能过磅
+        with self.assertRaises(Conflict) as cm:
+            svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "W8", weight_kg="1")
+        self.assertEqual(cm.exception.code, "batch_delivered")
+
+    # ------------------------------------------------------------ 复核裁定
+
+    def test_resolve_keep_leaves_single_original_ticket(self):
+        svc = self.w.svc
+        first = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "K1",
+                          weight_kg="100", device="D")
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "K1", weight_kg="90", device="D"))
+        result = svc.resolve_conflict(self.w.reviewer, exc.details["冲突编号"],
+                                      "keep", "纸单无误，补录错误")
+        self.assertEqual(result["冲突"]["状态"], "保留原值")
+        self.assertIsNone(result["新磅单"])
+        det = svc.get_batch_detail(self.w.coop, self.bid)
+        self.assertEqual(len(det["磅单"]), 1)
+        self.assertEqual(det["磅单"][0]["重量kg"], "100")
+        # 不可重复裁定
+        with self.assertRaises(Conflict) as cm:
+            svc.resolve_conflict(self.w.coop, exc.details["冲突编号"], "correct")
+        self.assertEqual(cm.exception.code, "conflict_resolved")
+
+    def test_resolve_correct_before_delivery_replaces_current_but_keeps_history(self):
+        svc = self.w.svc
+        first = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "C1",
+                          weight_kg="100", device="D")
+        svc.inspect(self.w.reviewer, first["磅单编号"], "A", "初检达标")
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.other_tree_id, "C1",
+            weight_kg="120", device="D"))
+        result = svc.resolve_conflict(self.w.coop, exc.details["冲突编号"],
+                                      "correct", "树群记混、净重实为120")
+        new_ticket = result["新磅单"]
+        self.assertEqual(new_ticket["重量kg"], "120")
+        self.assertEqual(new_ticket["树群编号"], self.other_tree_id)
+        self.assertEqual(new_ticket["更正自"], first["磅单编号"])
+
+        det = svc.get_batch_detail(self.w.coop, self.bid)
+        old_view = next(t for t in det["磅单"] if t["磅单编号"] == first["磅单编号"])
+        new_view = next(t for t in det["磅单"] if t["磅单编号"] == new_ticket["磅单编号"])
+        # 原单保留但非现行，原检验仍挂在原单上
+        self.assertFalse(old_view["现行"])
+        self.assertIsNotNone(old_view["检验编号"])
+        self.assertTrue(new_view["现行"])
+        self.assertIsNone(new_view["检验编号"])
+        # 树群已采重量按新口径迁移
+        self.assertEqual(svc.get_tree_group(
+            self.w.coop, self.w.old_tree_id)["本季已采重量kg"], "0")
+        self.assertEqual(svc.get_tree_group(
+            self.w.coop, self.other_tree_id)["本季已采重量kg"], "120")
+        # 新单未检，批次回到待检验，不能交货
+        with self.assertRaises(Conflict) as cm:
+            svc.deliver(self.w.coop, self.bid, "广兴饮料厂", self.w.contract_id,
+                        "2026-09-02T08:00:00+00:00")
+        self.assertEqual(cm.exception.code, "inspection_pending")
+        # 重检后方可交货，结算只认新单的 120kg
+        svc.inspect(self.w.reviewer, new_ticket["磅单编号"], "A", "更正后重检")
+        delivery = svc.deliver(self.w.coop, self.bid, "广兴饮料厂", self.w.contract_id,
+                               "2026-09-02T08:00:00+00:00")
+        self.assertEqual(delivery["磅单快照"], [new_ticket["磅单编号"]])
+        settlement = svc.settle(self.w.coop, delivery["交货单编号"])
+        self.assertEqual(settlement["明细行"][-1]["合计应收"], "480.00")
+        settled_ids = {r["磅单编号"] for r in settlement["明细行"] if "磅单编号" in r}
+        self.assertEqual(settled_ids, {new_ticket["磅单编号"]})
+
+    def test_correction_over_reservation_is_rejected_with_state_restored(self):
+        """更正到保护树若超预占：拒绝且原单重量/现行状态完整恢复。"""
+        svc = self.w.svc
+        svc.reserve_trees(self.w.coop, self.bid, self.w.heritage_id, "50")
+        first = svc.weigh(self.w.coop, self.bid, self.w.heritage_id, "C2", weight_kg="50")
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.heritage_id, "C2", weight_kg="60"))
+        with self.assertRaises(Conflict) as cm:
+            svc.resolve_conflict(self.w.coop, exc.details["冲突编号"], "correct")
+        self.assertEqual(cm.exception.code, "correction_over_reservation")
+        # 原单仍现行、重量仍 50，冲突仍是待复核
+        self.assertTrue(svc._tickets[first["磅单编号"]].现行)
+        self.assertEqual(svc.get_tree_group(
+            self.w.coop, self.w.heritage_id)["本季已采重量kg"], "50")
+        self.assertEqual(svc.get_conflict(
+            self.w.coop, exc.details["冲突编号"])["状态"], "待复核")
+
+    def test_replaying_original_slip_after_correction_is_still_replay(self):
+        """更正后离线秤又重推了最早的纸单：沿更正链识别为重放，不再报冲突。"""
+        svc = self.w.svc
+        svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "C3",
+                  weight_kg="100", device="D")
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "C3", weight_kg="120", device="D"))
+        svc.resolve_conflict(self.w.coop, exc.details["冲突编号"], "correct")
+        # 重传最初 100kg 的纸单
+        replay = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "C3",
+                           weight_kg="100", device="D")
+        self.assertTrue(replay["幂等命中"])
+
+    # ------------------------------------------------------------ 交货/结算后更正
+
+    def _delivered_settled_ticket(self, slip="P1", weight="100"):
+        svc = self.w.svc
+        ticket, _ = weigh_inspect_settle(
+            self.w, self.bid, self.w.old_tree_id, slip, weight, "A")
+        delivery = svc.deliver(self.w.coop, self.bid, "广兴饮料厂", self.w.contract_id,
+                               "2026-09-02T08:00:00+00:00")
+        settlement = svc.settle(self.w.coop, delivery["交货单编号"])
+        return ticket, delivery, settlement
+
+    def test_correction_after_settlement_only_writes_weight_adjustment(self):
+        svc = self.w.svc
+        ticket, delivery, settlement = self._delivered_settled_ticket("P1", "100")
+        # 结算后补传 90kg
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "P1", weight_kg="90"))
+        result = svc.resolve_conflict(self.w.coop, exc.details["冲突编号"],
+                                      "correct", "复核纸单90kg")
+        adj = result["差异调整"]
+        self.assertEqual(adj["重量差异kg"], "-10")
+        self.assertEqual(adj["差额"], "-40.00")
+        self.assertEqual(adj["方向"], "扣回")
+        self.assertEqual(adj["结算编号"], settlement["结算编号"])
+
+        # 原结算行 400.00 不变，以重量差异调整挂账
+        settled = svc.get_settlement(self.w.coop, settlement["结算编号"])
+        self.assertEqual(settled["明细行"][-1]["合计应收"], "400.00")
+        self.assertEqual(settled["状态"], "含调整")
+        self.assertEqual(len(settled["重量差异调整"]), 1)
+
+        det = svc.get_batch_detail(self.w.coop, self.bid)
+        old_view = next(t for t in det["磅单"] if t["磅单编号"] == ticket["磅单编号"])
+        new_view = next(t for t in det["磅单"]
+                        if t["磅单编号"] == result["新磅单"]["磅单编号"])
+        # 已结算原单不被替换：仍现行、仍挂原结算；新单带关联但不进结算链
+        self.assertTrue(old_view["现行"])
+        self.assertEqual(old_view["结算编号"], settlement["结算编号"])
+        self.assertEqual(new_view["更正自"], ticket["磅单编号"])
+        self.assertIsNone(new_view["结算编号"])
+        # 再次结算被拒：每公斤仍只在一条结算链上
+        with self.assertRaises(Conflict) as cm:
+            svc.settle(self.w.coop, delivery["交货单编号"])
+        self.assertEqual(cm.exception.code, "already_settled")
+
+    def test_correction_after_delivery_before_settle_monetized_at_settle(self):
+        svc = self.w.svc
+        ticket, _ = weigh_inspect_settle(self.w, self.bid, self.w.old_tree_id, "P2", "100", "A")
+        delivery = svc.deliver(self.w.coop, self.bid, "广兴饮料厂", self.w.contract_id,
+                               "2026-09-02T08:00:00+00:00")
+        exc = self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "P2", weight_kg="110"))
+        result = svc.resolve_conflict(self.w.coop, exc.details["冲突编号"], "correct")
+        # 裁定时尚未结算，货款差额在结算时才按交货价规固化
+        self.assertIsNone(result["差异调整"]["差额"])
+        settlement = svc.settle(self.w.coop, delivery["交货单编号"])
+        self.assertEqual(settlement["明细行"][-1]["合计应收"], "400.00")
+        adj = settlement["重量差异调整"][0]
+        self.assertEqual(adj["重量差异kg"], "10")
+        self.assertEqual(adj["差额"], "40.00")
+        self.assertEqual(adj["方向"], "补付")
+
+    # ------------------------------------------------------------ 并发交错
+
+    def test_concurrent_divergent_resubmits_one_ticket_one_conflict(self):
+        svc = self.w.svc
+        # 先有一张 30kg 原单，再让 8 个离线补传并发到达：7 条同内容、1 条被改成 31kg
+        svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "X9",
+                  weight_kg="30", device="D")
+        replayed = []
+        conflicted = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def go(i):
+            barrier.wait()
+            weight = "30" if i else "31"  # 0 号线程是被改错的那条
+            try:
+                view = svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "X9",
+                                 weight_kg=weight, device="D")
+                self.assertTrue(view.get("幂等命中"))
+                with lock:
+                    replayed.append(view["磅单编号"])
+            except Conflict:
+                with lock:
+                    conflicted.append(True)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(go, range(8)))
+        self.assertEqual(len(replayed), 7)
+        self.assertEqual(len(conflicted), 1)
+        self.assertEqual(len(svc.get_batch_detail(self.w.coop, self.bid)["磅单"]), 1)
+        pending = svc.list_conflicts(self.w.coop, status="待复核")
+        self.assertEqual(len([c for c in pending if c["过磅流水号"] == "X9"]), 1)
+
+    def test_conflicting_resend_interleaved_with_settle_keeps_single_chain(self):
+        """补传冲突与结算并发交错：结算只沿交货快照，冲突不吞掉任何一公斤。"""
+        svc = self.w.svc
+        ticket, delivery = None, None
+        t, _ = weigh_inspect_settle(self.w, self.bid, self.w.old_tree_id, "X8", "100", "A")
+        ticket = t
+        delivery = svc.deliver(self.w.coop, self.bid, "广兴饮料厂", self.w.contract_id,
+                               "2026-09-02T08:00:00+00:00")
+        barrier = threading.Barrier(2)
+
+        def settle():
+            barrier.wait()
+            try:
+                svc.settle(self.w.coop, delivery["交货单编号"])
+            except Conflict:
+                pass
+
+        def resend():
+            barrier.wait()
+            try:
+                svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "X8", weight_kg="90")
+            except Conflict:
+                pass
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda f: f(), [settle, resend]))
+
+        ledger = svc.list_ledger(self.w.coop, "农户结算")["记录"]
+        self.assertEqual(len(ledger), 1)
+        # 原 100kg 正常结算；冲突仍待复核，没有任何第二张结算单
+        self.assertEqual(ledger[0]["明细行"][-1]["合计应收"], "400.00")
+        pending = svc.list_conflicts(self.w.coop, status="待复核")
+        self.assertEqual(len(pending), 1)
+
+    # ------------------------------------------------------------ 权限裁剪
+
+    def test_conflict_visibility_is_scoped_by_role(self):
+        svc = self.w.svc
+        svc.weigh(self.w.coop, self.bid, self.w.old_tree_id, "V1", weight_kg="100")
+        self._conflict_of(lambda: svc.weigh(
+            self.w.coop, self.bid, self.w.old_tree_id, "V1", weight_kg="90"))
+
+        # 果农：只看本人裁剪摘要，无身份/付款/补传人字段
+        farmer_view = svc.list_conflicts(self.w.farmer)
+        self.assertEqual(len(farmer_view), 1)
+        for forbidden in ("农户编号", "补传人", "裁定人", "原摘要", "补传摘要"):
+            self.assertNotIn(forbidden, farmer_view[0])
+        self.assertIn("差异字段", farmer_view[0])
+        # 第二位农户看不到
+        self.assertEqual(svc.list_conflicts(self.w.farmer2), [])
+        # 企业与护树员无权查看冲突
+        with self.assertRaises(PermissionDenied):
+            svc.list_conflicts(self.w.ent)
+        with self.assertRaises(PermissionDenied):
+            svc.list_conflicts(self.w.guard)
+        # 果农、护树员、企业都无权裁定
+        from domain import Actor  # noqa: F401
+        cid = farmer_view[0]["冲突编号"]
+        for actor in (self.w.farmer, self.w.guard, self.w.ent):
+            with self.assertRaises(PermissionDenied):
+                svc.resolve_conflict(actor, cid, "keep")
+        # 合作社与质量复核人可以裁定
+        svc.resolve_conflict(self.w.coop, cid, "keep")
+
+
+    def test_post_delivery_correction_does_not_pollute_next_batch_quota(self):
+        """保护树交货后更正出的差异单不是新采收事件：不计入下一批次重量/次数配额。"""
+        svc = self.w.svc
+        # 第一批：预占 50、过磅 50、检验、交货、结算后补传 40 → 差异调整
+        b1 = svc.open_batch(self.w.coop, self.w.plot_id, "2026-09-01", "2026秋")["批次编号"]
+        svc.reserve_trees(self.w.coop, b1, self.w.heritage_id, "50")
+        t = svc.weigh(self.w.coop, b1, self.w.heritage_id, "Q1", weight_kg="50")
+        svc.inspect(self.w.reviewer, t["磅单编号"], "A", "达标")
+        svc.deliver(self.w.coop, b1, "广兴饮料厂", self.w.contract_id,
+                    "2026-09-02T08:00:00+00:00")
+        try:
+            svc.weigh(self.w.coop, b1, self.w.heritage_id, "Q1", weight_kg="40")
+        except Conflict as exc:
+            cid = exc.details["冲突编号"]
+        svc.resolve_conflict(self.w.coop, cid, "correct")
+
+        # 第二批：本季配额 100kg/2 次。b1 已预占 50，本批再预占 50 应可过
+        b2 = svc.open_batch(self.w.coop, self.w.plot_id, "2026-09-05", "2026秋")["批次编号"]
+        svc.reserve_trees(self.w.coop, b2, self.w.heritage_id, "50")
+        # 本季第二次采摘（差异单不得被算作第三次）：成功
+        t2 = svc.weigh(self.w.coop, b2, self.w.heritage_id, "Q2", weight_kg="50")
+        self.assertNotIn("幂等命中", t2)
+        self.assertEqual(svc.get_tree_group(
+            self.w.coop, self.w.heritage_id)["本季已采次数"], 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
