@@ -5,8 +5,12 @@
 
 * **连续溯源链**：地块 → 树群 → 管护记录 → 采收批次 → 磅单 → 检验 → 企业交货，
   每一环节都引用上一环节的编号，任何一环缺失都无法进入下一环节。
-* **每公斤只结算一次**：磅单以 ``(批次, 过磅流水号)`` 幂等，断网重传同一批果不会
-  重复入库；结算以磅单为粒度，已结算磅单被结算流水永久引用。
+* **每公斤只结算一次**：磅单以 ``(批次, 过磅流水号)`` 定位、以业务摘要（树群/净重/
+  设备号的稳定 SHA-256）判定——同摘要补传是重放，只返回原单；关键字段被人工补录
+  改变则保留原单（不动树群已采重量、预占与既有检验），另立「待复核」冲突。冲突由
+  合作社/质量复核人复核：保留原值，或交货前生成双向关联的更正磅单；已交货/已结算
+  的磅单不得替换，只能形成重量差异调整。结算以现行磅单为粒度，已结算磅单被结算流水
+  永久引用。
 * **保护树不得越界**：保护树群有按采收季生效的配额（重量 + 次数），配额按批次
   预占，磅单回冲；预占超额或磅单超出所属批次的预占额度都会被拒绝。
 * **价格不回溯**：农户应收按 *签约时规则 + 交货时适用规则* 计算并写入结算流水，
@@ -21,11 +25,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from typing import get_type_hints
 
 # ---------------------------------------------------------------------------
 # 角色
@@ -40,6 +47,10 @@ ROLE_ENTERPRISE = "收购企业"  # 交货对接、成品原料反查
 # 结算明细属于合作社财务域，护树队无权查看
 SETTLER_ROLES = {ROLE_COOP}
 SETTLE_DETAIL_VIEWERS = {ROLE_COOP}
+# 磅单冲突复核：合作社与质量复核人有权处置，果农只能看到自己的冲突摘要
+CONFLICT_RESOLVER_ROLES = {ROLE_COOP, ROLE_REVIEWER}
+# 付款/结算字段属于财务域；冲突摘要里只有差异调整编号会通向付款链，对果农裁剪
+CONFLICT_PAYMENT_FIELDS = {"调整编号"}
 
 # 护树队可见的最小树群视图
 GUARD_TREE_VIEW = {"编号", "树群编号", "地块编号", "保护级别", "树种", "树龄年", "健康状态"}
@@ -52,6 +63,11 @@ def _now() -> str:
 def _money(value) -> str:
     """金额统一为两位小数字符串，避免浮点误差。"""
     return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _canonical_weight(value: Decimal) -> str:
+    """净重规范化：数值相同即同串（100 与 100.0 都为 "100"，0.10 为 "0.1"）。"""
+    return format(value.normalize(), "f")
 
 
 class DomainError(Exception):
@@ -75,8 +91,9 @@ class NotFound(DomainError):
 class Conflict(DomainError):
     status = 409
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, extra: dict | None = None):
         super().__init__(code, message)
+        self.extra = extra or {}
 
 
 class AuthError(DomainError):
@@ -173,6 +190,58 @@ class WeighTicket:
     同步时间: str
     检验编号: str | None = None
     结算编号: str | None = None
+    业务摘要: str = ""              # 关键字段稳定摘要：同号同摘要才是重放
+    状态: str = "正常"              # 正常/已更正/更正单
+    更正自: str | None = None       # 更正单指向原磅单
+    更正为: str | None = None       # 原磅单指向现行更正单
+    冲突编号: str | None = None     # 该磅单当前待复核冲突（待复核/保留原值）
+
+
+@dataclass
+class TicketConflict:
+    """同批次同流水号但业务摘要不同：原磅单原样保留，差异进入人工复核。"""
+    编号: str
+    批次编号: str
+    过磅流水号: str
+    农户编号: str
+    原磅单编号: str
+    原摘要: str
+    补传摘要: str
+    字段差异: list[dict]
+    补传净重kg: Decimal
+    补传树群编号: str
+    补传设备号: str
+    补传毛重kg: Decimal | None
+    补传皮重kg: Decimal | None
+    补传过磅时间: str
+    补传断网离线: bool
+    补传人: str
+    首次发现时间: str
+    最近补传时间: str
+    补传次数: int = 1
+    状态: str = "待复核"            # 待复核/保留原值/已更正
+    复核人: str | None = None
+    复核时间: str | None = None
+    复核意见: str = ""
+    更正磅单编号: str | None = None
+    调整编号: str | None = None
+
+
+@dataclass
+class WeightAdjustment:
+    """已交货/已结算磅单的更正不能替换原单，只能形成重量差异调整。"""
+    编号: str
+    冲突编号: str
+    原磅单编号: str
+    批次编号: str
+    农户编号: str
+    原净重kg: Decimal
+    更正净重kg: Decimal
+    差异kg: Decimal                 # 正=补付，负=扣回
+    时间: str
+    结算编号: str | None            # 结算前产生则待结算时入账
+    状态: str = "待入账"            # 待入账/已入账
+    结算单价: str | None = None
 
 
 @dataclass
@@ -238,6 +307,7 @@ class Settlement:
     时间: str
     行: list[dict] = field(default_factory=list)
     调整编号: list[str] = field(default_factory=list)
+    重量调整编号: list[str] = field(default_factory=list)
     状态: str = "正常"            # 正常 / 含调整
 
 
@@ -308,6 +378,45 @@ class Violation:
     处理状态: str = "待处理"
 
 
+# 标注为 dict、但叶子值是 Decimal 的字段（快照恢复时需还原数值）
+_DECIMAL_DICT_FIELDS = {
+    "PriceRule": {"保护价", "质量系数", "市场价参考"},
+}
+
+
+def _json_default(obj):
+    if isinstance(obj, Decimal):
+        return str(obj)
+    if isinstance(obj, deque):
+        return list(obj)
+    raise TypeError(f"不可序列化的类型：{type(obj)!r}")
+
+
+def _to_primitive(obj) -> dict:
+    return json.loads(json.dumps(asdict(obj), ensure_ascii=False, default=_json_default))
+
+
+def _from_primitive(cls, raw: dict):
+    hints = get_type_hints(cls)
+    dec_dicts = _DECIMAL_DICT_FIELDS.get(cls.__name__, set())
+    kwargs = {}
+    for f in fields(cls):
+        if f.name not in raw:
+            continue
+        val = raw[f.name]
+        if val is None:
+            kwargs[f.name] = None
+        elif f.name in dec_dicts:
+            kwargs[f.name] = {k: Decimal(v) for k, v in val.items()}
+        else:
+            ann = hints.get(f.name)
+            if ann is Decimal or Decimal in getattr(ann, "__args__", ()):
+                kwargs[f.name] = Decimal(val)
+            else:
+                kwargs[f.name] = val
+    return cls(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # 领域服务
 # ---------------------------------------------------------------------------
@@ -336,11 +445,15 @@ class HeritageCitrusService:
         self._losses: dict[str, TransitLoss] = {}
         self._routes: dict[str, ProcessingRoute] = {}
         self._violations: dict[str, Violation] = {}
+        self._conflicts: dict[str, TicketConflict] = {}
+        self._weight_adjustments: dict[str, WeightAdjustment] = {}
 
         # 配额：树群 -> 季 -> 限额
         self._quotas: dict[tuple[str, str], dict] = {}
         # 保护树预占：批次 -> 树群 -> 重量
         self._reservations: dict[str, dict[str, Decimal]] = {}
+        # 幂等索引：(批次, 过磅流水号) -> 现行原磅单（含已更正原单）
+        self._slip_index: dict[tuple[str, str], str] = {}
 
         self._seq = 0
         self._farmer_of_plot: dict[str, str] = {}
@@ -360,6 +473,34 @@ class HeritageCitrusService:
         if d < 0:
             raise ValidationFailed(f"{label}不能为负")
         return d
+
+    @staticmethod
+    def _ticket_digest(tree_id: str, weight: Decimal, device: str) -> str:
+        """对业务关键字段（树群、净重、设备号）生成稳定摘要。
+
+        只纳入会影响采收额度、检验与结算来源的字段；毛/皮重以算出的净重为准，
+        过磅时间、离线标记不影响果实归属与计价。字段名顺序固定，摘要跨重启稳定。
+        """
+        payload = json.dumps(
+            {"树群编号": tree_id, "净重kg": _canonical_weight(weight), "设备号": device},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _field_diffs(ticket: "WeighTicket", tree_id: str, weight: Decimal,
+                     device: str) -> list[dict]:
+        diffs = []
+        if ticket.重量kg != weight:
+            diffs.append({"字段": "净重kg", "原值": str(ticket.重量kg),
+                          "补传值": str(weight)})
+        if ticket.树群编号 != tree_id:
+            diffs.append({"字段": "树群编号", "原值": ticket.树群编号,
+                          "补传值": tree_id})
+        if ticket.设备号 != device:
+            diffs.append({"字段": "设备号", "原值": ticket.设备号,
+                          "补传值": device})
+        return diffs
 
     def _require_role(self, actor: Actor, roles: set[str], what: str):
         if actor.role not in roles:
@@ -517,11 +658,17 @@ class HeritageCitrusService:
     def weigh(self, actor: Actor, batch_id: str, tree_id: str, slip_no: str,
               weight_kg=None, gross_kg=None, tare_kg=None, offline=False,
               device: str = "", at: str | None = None) -> dict:
-        """登记过磅单。
+        """登记过磅单（断网设备可重传）。
 
-        * ``(批次, 过磅流水号)`` 幂等：断网设备恢复后重传同一张纸单/同一流水号，
-          返回原记录而不是第二次入账——这是“同一批果不重复结算”的根。
-        * 保护树群的磅单回冲本批次预占，超出预占即拒绝（现场超采立即暴露）。
+        幂等以 ``(批次, 过磅流水号)`` 定位、以**业务摘要**判定：
+
+        * 同号且摘要相同（树群/净重/设备号一致）——重放，返回原磅单并标记
+          ``幂等命中``，不二次入库、不动任何统计。
+        * 同号但任一关键字段不同——人工补录冲突：原磅单原样保留（树群已采重量、
+          预占额度、既有检验一律不动），登记/归并一条待复核冲突并返回 409。
+        * 校验失败的请求在任何登记之前拒绝，不占用过磅流水号。
+
+        保护树群的磅单回冲本批次预占，超出预占即拒绝（现场超采立即暴露）。
         """
         self._require_role(actor, {ROLE_COOP, ROLE_FARMER}, "过磅登记")
         with self._lock:
@@ -529,19 +676,13 @@ class HeritageCitrusService:
             if batch is None:
                 raise NotFound("采收批次")
             self._farmer_scope(actor, batch.农户编号)
-            if batch.状态 == "已交货":
-                raise Conflict("batch_delivered", "批次已交货，不能追加过磅")
             tree = self._trees.get(tree_id)
             if tree is None:
                 raise NotFound("树群")
             if self._farmer_of_plot[tree.地块编号] != batch.农户编号:
                 raise ValidationFailed("树群不属于该批次所属农户的地块")
 
-            # 幂等：同批次同流水号只认第一次
-            for t in self._tickets.values():
-                if t.批次编号 == batch_id and t.过磅流水号 == slip_no:
-                    return self._ticket_view(t, actor, duplicated=True)
-
+            # 先解析并校验净重——非法补传在登记冲突前被拒，不产生任何痕迹
             if weight_kg is not None:
                 weight = self._dec(weight_kg, "净重")
                 gross = self._dec(gross_kg, "毛重") if gross_kg is not None else None
@@ -554,8 +695,23 @@ class HeritageCitrusService:
                     raise ValidationFailed("皮重不能大于毛重")
             if weight <= 0:
                 raise ValidationFailed("过磅净重必须大于零")
+            digest = self._ticket_digest(tree_id, weight, device)
 
-            # 保护树：回冲预占 + 配额次数
+            # 同批次同流水号：先区分重放与冲突（交货/结算后重放同样走这里，
+            # 保证同一张纸单永远只返回它自己）
+            existing_id = self._slip_index.get((batch_id, slip_no))
+            if existing_id is not None:
+                original = self._tickets[existing_id]
+                if original.业务摘要 == digest:
+                    return self._ticket_view(original, actor, duplicated=True)
+                return self._register_conflict(
+                    actor, original, batch, tree_id, weight, gross, tare,
+                    device, bool(offline), at or _now(), digest)
+
+            if batch.状态 == "已交货":
+                raise Conflict("batch_delivered", "批次已交货，不能追加过磅")
+
+            # 保护树：回冲预占 + 配额次数（已被更正取代的原单不计入在用量）
             if tree.保护级别 == "百年保护树":
                 quota = self._quotas.get((tree_id, batch.季))
                 if quota is None:
@@ -565,6 +721,7 @@ class HeritageCitrusService:
                 used = sum(
                     tk.重量kg for tk in self._tickets.values()
                     if tk.批次编号 == batch_id and tk.树群编号 == tree_id
+                    and tk.状态 != "已更正"
                 )
                 if used + weight > reserved:
                     raise Conflict(
@@ -574,7 +731,7 @@ class HeritageCitrusService:
                     )
                 times_used = sum(
                     1 for tk in self._tickets.values()
-                    if tk.树群编号 == tree_id
+                    if tk.树群编号 == tree_id and tk.状态 != "已更正"
                     and self._batches[tk.批次编号].季 == batch.季
                 )
                 if times_used + 1 > quota["次数"]:
@@ -586,9 +743,10 @@ class HeritageCitrusService:
                 编号=tid, 批次编号=batch_id, 树群编号=tree_id, 过磅流水号=slip_no,
                 重量kg=weight, 毛重kg=gross, 皮重kg=tare,
                 过磅时间=at or _now(), 断网离线=bool(offline), 设备号=device,
-                同步时间=_now(),
+                同步时间=_now(), 业务摘要=digest,
             )
             self._tickets[tid] = ticket
+            self._slip_index[(batch_id, slip_no)] = tid
             tree.本季已采重量 += weight
             tree.本季已采次数 += 1
             if tree_id not in batch.来源树群:
@@ -596,6 +754,242 @@ class HeritageCitrusService:
             if batch.状态 == "采收中":
                 batch.状态 = "待检验"
             return self._ticket_view(ticket, actor)
+
+    # ------------------------------------------------------------------ 冲突复核
+
+    def _register_conflict(self, actor: Actor, original: WeighTicket, batch: HarvestBatch,
+                           tree_id: str, weight: Decimal, gross: Decimal | None,
+                           tare: Decimal | None, device: str, offline: bool,
+                           at: str, digest: str) -> dict:
+        """同号不同摘要：保留原磅单，归并/开立待复核冲突，不修改任何额度与检验。"""
+        diffs = self._field_diffs(original, tree_id, weight, device)
+        open_conflict = next(
+            (c for c in self._conflicts.values()
+             if c.原磅单编号 == original.编号 and c.状态 == "待复核"), None)
+        now = _now()
+        if open_conflict is None:
+            cid = self._id("冲突")
+            rec = TicketConflict(
+                编号=cid, 批次编号=batch.编号, 过磅流水号=original.过磅流水号,
+                农户编号=batch.农户编号, 原磅单编号=original.编号,
+                原摘要=original.业务摘要, 补传摘要=digest, 字段差异=diffs,
+                补传净重kg=weight, 补传树群编号=tree_id, 补传设备号=device,
+                补传毛重kg=gross, 补传皮重kg=tare, 补传过磅时间=at,
+                补传断网离线=offline, 补传人=actor.name, 首次发现时间=now,
+                最近补传时间=now,
+            )
+            self._conflicts[cid] = rec
+            original.冲突编号 = cid
+        else:
+            # 同一待复核冲突的再次补传：只归并审计信息，重复字段差异不累加
+            open_conflict.补传摘要 = digest
+            open_conflict.字段差异 = diffs
+            open_conflict.补传净重kg = weight
+            open_conflict.补传树群编号 = tree_id
+            open_conflict.补传设备号 = device
+            open_conflict.补传毛重kg = gross
+            open_conflict.补传皮重kg = tare
+            open_conflict.补传过磅时间 = at
+            open_conflict.补传断网离线 = offline
+            open_conflict.最近补传时间 = now
+            open_conflict.补传次数 += 1
+            rec = open_conflict
+        raise Conflict(
+            "ticket_conflict",
+            f"过磅流水号 {original.过磅流水号} 的补传与原磅单业务字段不一致"
+            f"（{'、'.join(d['字段'] for d in diffs)}），原磅单保留，待有权限角色复核",
+            extra={"冲突": self._conflict_view(rec)},
+        )
+
+    def list_conflicts(self, actor: Actor, status: str | None = None) -> list[dict]:
+        """冲突列表：合作社/质量复核人见全量，果农只见本人且为去付款字段摘要。"""
+        if actor.role in {ROLE_GUARD, ROLE_ENTERPRISE}:
+            raise PermissionDenied("查看磅单冲突")
+        with self._lock:
+            out = []
+            for c in self._conflicts.values():
+                if status is not None and c.状态 != status:
+                    continue
+                if actor.role == ROLE_FARMER:
+                    if c.农户编号 != actor.farmer_id:
+                        continue
+                    out.append(self._conflict_view(c, masked=True))
+                else:
+                    out.append(self._conflict_view(c))
+            return out
+
+    def get_conflict(self, actor: Actor, conflict_id: str) -> dict:
+        if actor.role in {ROLE_GUARD, ROLE_ENTERPRISE}:
+            raise PermissionDenied("查看磅单冲突")
+        with self._lock:
+            c = self._conflicts.get(conflict_id)
+            if c is None:
+                raise NotFound("磅单冲突")
+            if actor.role == ROLE_FARMER and c.农户编号 != actor.farmer_id:
+                raise PermissionDenied("查看他人冲突")
+            return self._conflict_view(c, masked=(actor.role == ROLE_FARMER))
+
+    def resolve_ticket_conflict(self, actor: Actor, conflict_id: str,
+                                decision: str, note: str = "") -> dict:
+        """有权限角色复核冲突：保留原值，或生成带关联的更正。
+
+        * ``保留原值``：原磅单继续生效，冲突留痕关闭。
+        * ``生成更正磅单``：
+          - 交货前：原磅单标记“已更正”并完整保留（含既有检验），另立“更正单”
+            与之双向关联，树群已采重量/预占按新旧差平移、重新过配额；
+          - 已交货或已结算：原磅单不得替换，只生成重量差异调整（结算前待入账、
+            结算后挂原结算单补付/扣回）。
+        """
+        self._require_role(actor, CONFLICT_RESOLVER_ROLES, "复核磅单冲突")
+        if decision not in {"保留原值", "生成更正磅单"}:
+            raise ValidationFailed("复核结论必须是 保留原值 / 生成更正磅单")
+        with self._lock:
+            conflict = self._conflicts.get(conflict_id)
+            if conflict is None:
+                raise NotFound("磅单冲突")
+            if conflict.状态 != "待复核":
+                raise Conflict("conflict_resolved",
+                               f"该冲突已{conflict.状态}，不能重复复核")
+            original = self._tickets[conflict.原磅单编号]
+
+            if decision == "保留原值":
+                conflict.状态 = "保留原值"
+                self._stamp_conflict_review(conflict, actor, note)
+                if original.冲突编号 == conflict.编号:
+                    original.冲突编号 = None
+                return {"冲突": self._conflict_view(conflict), "处置": "保留原值",
+                        "现行磅单": self._ticket_view(original, actor)}
+
+            if original.状态 == "已更正":
+                raise Conflict("conflict_resolved", "原磅单已被更正单取代")
+
+            batch = self._batches[original.批次编号]
+            if batch.状态 != "已交货":
+                new_ticket = self._apply_correction_ticket(actor, conflict, original, batch, note)
+                result = {"冲突": self._conflict_view(conflict), "处置": "更正磅单",
+                          "更正磅单": self._ticket_view(new_ticket, actor),
+                          "原磅单": self._ticket_view(original, actor)}
+            else:
+                adjustment = self._apply_post_delivery_adjustment(
+                    conflict, original, batch, actor, note)
+                result = {"冲突": self._conflict_view(conflict),
+                          "处置": "差异调整" if original.结算编号 is None else "差异调整(已结算)",
+                          "差异调整": self._weight_adjustment_view(adjustment),
+                          "原磅单": self._ticket_view(original, actor)}
+            return result
+
+    @staticmethod
+    def _stamp_conflict_review(conflict: TicketConflict, actor: Actor, note: str) -> None:
+        conflict.复核人 = actor.name
+        conflict.复核时间 = _now()
+        conflict.复核意见 = note
+
+    def _apply_correction_ticket(self, actor: Actor, conflict: TicketConflict,
+                                 original: WeighTicket, batch: HarvestBatch,
+                                 note: str) -> WeighTicket:
+        """交货前更正：原单留痕，新单承接流水号；统计与配额按新旧差平移。"""
+        new_tree_id = conflict.补传树群编号
+        new_weight = conflict.补传净重kg
+        new_tree = self._trees.get(new_tree_id)
+        if new_tree is None:
+            raise NotFound("更正目标树群")
+        if self._farmer_of_plot[new_tree.地块编号] != batch.农户编号:
+            raise ValidationFailed("树群不属于该批次所属农户的地块")
+
+        old_tree = self._trees[original.树群编号]
+        if new_tree.保护级别 == "百年保护树":
+            quota = self._quotas.get((new_tree_id, batch.季))
+            if quota is None:
+                raise Conflict("quota_not_set",
+                               "更正目标保护树群本采收季尚未下达配额，不能转入")
+            reserved = self._reservations.get(batch.编号, {}).get(new_tree_id, Decimal("0"))
+            # 新树群在用量：原单若也计入该树群需先扣除，再放更正重量
+            used = sum(
+                tk.重量kg for tk in self._tickets.values()
+                if tk.批次编号 == batch.编号 and tk.树群编号 == new_tree_id
+                and tk.状态 != "已更正" and tk.编号 != original.编号
+            )
+            if used + new_weight > reserved:
+                raise Conflict(
+                    "over_reservation",
+                    f"更正被拒：{new_tree.名称} 本批次预占 {reserved}kg，"
+                    f"现行已过磅 {used}kg，更正净重 {new_weight}kg 超出额度；"
+                    f"冲突保持待复核，可改判保留原值",
+                )
+            # 次数按“平移”计：更正单在新树群占一次（若原单本就在该树群，
+            # 原单稍后让出一次，次数净变化为零）
+            def season_pick_count(tree_id: str) -> int:
+                return sum(
+                    1 for tk in self._tickets.values()
+                    if tk.树群编号 == tree_id and tk.状态 != "已更正"
+                    and tk.编号 != original.编号
+                    and self._batches[tk.批次编号].季 == batch.季)
+            if season_pick_count(new_tree_id) + 1 > quota["次数"]:
+                raise Conflict("quota_times_exceeded",
+                               f"更正被拒：{new_tree.名称} 本季采摘次数将超过配额 {quota['次数']} 次")
+
+        tid = self._id("磅单")
+        corrected = WeighTicket(
+            编号=tid, 批次编号=batch.编号, 树群编号=new_tree_id,
+            过磅流水号=original.过磅流水号, 重量kg=new_weight,
+            毛重kg=conflict.补传毛重kg, 皮重kg=conflict.补传皮重kg,
+            过磅时间=conflict.补传过磅时间, 断网离线=conflict.补传断网离线,
+            设备号=conflict.补传设备号, 同步时间=_now(),
+            业务摘要=self._ticket_digest(new_tree_id, new_weight, conflict.补传设备号),
+            状态="更正单", 更正自=original.编号,
+        )
+        self._tickets[tid] = corrected
+        # 统计平移：原单退出，新单进入
+        old_tree.本季已采重量 -= original.重量kg
+        old_tree.本季已采次数 -= 1
+        new_tree.本季已采重量 += new_weight
+        new_tree.本季已采次数 += 1
+        if new_tree_id not in batch.来源树群:
+            batch.来源树群.append(new_tree_id)
+        # 原单与索引切换
+        original.状态 = "已更正"
+        original.更正为 = tid
+        original.冲突编号 = None
+        self._slip_index[(batch.编号, original.过磅流水号)] = tid
+        conflict.状态 = "已更正"
+        conflict.更正磅单编号 = tid
+        self._stamp_conflict_review(conflict, actor, note)
+        return corrected
+
+    def _apply_post_delivery_adjustment(self, conflict: TicketConflict,
+                                        original: WeighTicket, batch: HarvestBatch,
+                                        actor: Actor, note: str) -> WeightAdjustment:
+        """交货/结算后只出重量差异调整，绝不替换原磅单、不改树群统计。"""
+        diff = conflict.补传净重kg - original.重量kg
+        aid = self._id("重量调整")
+        settlement_id = original.结算编号
+        unit: Decimal | None = None
+        status = "待入账"
+        if settlement_id is not None:
+            # 已结算：按现行检验等级与交货锁定价规立即计价挂账（补付/扣回），
+            # 原结算明细行与合计不被改写，调整以独立行挂在结算单的“重量调整”列表
+            settlement = self._settlements[settlement_id]
+            delivery = self._deliveries[settlement.交货单编号]
+            current_insp = self._inspections[original.检验编号]
+            unit = self._grade_unit_price(delivery.价规编号, current_insp.等级)
+            status = "已入账"
+        rec = WeightAdjustment(
+            编号=aid, 冲突编号=conflict.编号, 原磅单编号=original.编号,
+            批次编号=batch.编号, 农户编号=batch.农户编号,
+            原净重kg=original.重量kg, 更正净重kg=conflict.补传净重kg,
+            差异kg=diff, 时间=_now(), 结算编号=settlement_id, 状态=status,
+            结算单价=_money(unit) if unit is not None else None,
+        )
+        self._weight_adjustments[aid] = rec
+        if settlement_id is not None:
+            settlement.重量调整编号.append(aid)
+            settlement.状态 = "含调整"
+        original.冲突编号 = None
+        conflict.状态 = "已更正"
+        conflict.调整编号 = aid
+        self._stamp_conflict_review(conflict, actor, note)
+        return rec
+
 
     # ------------------------------------------------------------------ 检验与复核
 
@@ -607,6 +1001,9 @@ class HeritageCitrusService:
             ticket = self._tickets.get(ticket_id)
             if ticket is None:
                 raise NotFound("磅单")
+            if ticket.状态 == "已更正":
+                raise Conflict("ticket_superseded",
+                               "该磅单已被更正单取代，原检验保留留痕，请对更正单检验")
             batch = self._batches[ticket.批次编号]
             if ticket.检验编号 is not None:
                 raise Conflict("already_inspected", "该磅单已完成初检")
@@ -639,6 +1036,9 @@ class HeritageCitrusService:
             if not old.现行:
                 raise Conflict("superseded", "该检验已被后续复核取代，请对最新记录复核")
             ticket = self._tickets[old.磅单编号]
+            if ticket.状态 == "已更正":
+                raise Conflict("ticket_superseded",
+                               "磅单已被更正单取代，不能再对其旧检验复核；请对更正单的现行检验复核")
             old.现行 = False
             iid = self._id("检验")
             new = Inspection(
@@ -754,12 +1154,18 @@ class HeritageCitrusService:
                 raise ValidationFailed("合约收购企业与交货企业不一致")
             if batch.状态 == "已交货":
                 raise Conflict("already_delivered", "该批次已交货")
-            tickets = [t for t in self._tickets.values() if t.批次编号 == batch_id]
+            tickets = [t for t in self._tickets.values()
+                       if t.批次编号 == batch_id and t.状态 != "已更正"]
             if not tickets:
                 raise Conflict("empty_batch", "空批次不能交货")
             unspected = [t.编号 for t in tickets if t.检验编号 is None]
             if unspected:
                 raise Conflict("inspection_pending", f"尚有磅单未检验：{unspected}")
+            open_conflicts = [c.编号 for c in self._conflicts.values()
+                              if c.批次编号 == batch_id and c.状态 == "待复核"]
+            if open_conflicts:
+                raise Conflict("conflict_pending",
+                               f"批次存在待复核磅单冲突，须先复核再交货：{open_conflicts}")
 
             applicable = self._rule_at(delivered_at)
             did = self._id("交货")
@@ -783,9 +1189,12 @@ class HeritageCitrusService:
                 raise NotFound("交货单")
             batch = self._batches[delivery.批次编号]
 
-            tickets = [t for t in self._tickets.values() if t.批次编号 == batch.编号]
+            tickets = [t for t in self._tickets.values()
+                       if t.批次编号 == batch.编号 and t.状态 != "已更正"]
             fresh = [t for t in tickets if t.结算编号 is None]
-            if not fresh:
+            pending_adj = [a for a in self._weight_adjustments.values()
+                           if a.批次编号 == batch.编号 and a.状态 == "待入账"]
+            if not fresh and not pending_adj:
                 settled = [t.结算编号 for t in tickets]
                 raise Conflict("already_settled",
                                f"该交货批次全部磅单已结算（{sorted(set(settled))}），每公斤果实只能结算一次")
@@ -811,7 +1220,34 @@ class HeritageCitrusService:
                     "检验编号": insp.编号,
                     "单价": _money(unit),
                     "金额": _money(amount),
+                    "状态": t.状态,
                 })
+            # 交货后、结算前形成的重量差异：按原磅单现行检验等级与交货锁定价规计价入账
+            adj_total = Decimal("0")
+            for adj in sorted(pending_adj, key=lambda x: x.编号):
+                src = self._tickets[adj.原磅单编号]
+                insp = self._inspections[src.检验编号]
+                unit = self._grade_unit_price(delivery.价规编号, insp.等级)
+                amount = unit * adj.差异kg
+                adj_total += amount
+                adj.结算编号 = sid
+                adj.状态 = "已入账"
+                adj.结算单价 = _money(unit)
+                settlement.重量调整编号.append(adj.编号)
+                settlement.行.append({
+                    "重量调整编号": adj.编号,
+                    "原磅单编号": adj.原磅单编号,
+                    "冲突编号": adj.冲突编号,
+                    "原重量kg": str(adj.原净重kg),
+                    "更正重量kg": str(adj.更正净重kg),
+                    "差异kg": str(adj.差异kg),
+                    "等级": insp.等级,
+                    "单价": _money(unit),
+                    "金额": _money(amount),
+                })
+            total += adj_total
+            if pending_adj:
+                settlement.状态 = "含调整"
             settlement.行.append({"合计应收": _money(total),
                                   "计价价规": delivery.价规编号,
                                   "签约价规": self._contracts[delivery.合约编号].价规编号})
@@ -1017,7 +1453,8 @@ class HeritageCitrusService:
 
             batch = self._batches[delivery.批次编号]
             plot = self._plots[batch.地块编号]
-            tickets = [t for t in self._tickets.values() if t.批次编号 == batch.编号]
+            tickets = [t for t in self._tickets.values()
+                       if t.批次编号 == batch.编号 and t.状态 != "已更正"]
             tree_ids = sorted({t.树群编号 for t in tickets})
             chain = {
                 "交货单": self._delivery_view(delivery),
@@ -1035,7 +1472,8 @@ class HeritageCitrusService:
                 "磅单与检测依据": [
                     {
                         "磅单": self._ticket_view(t, actor),
-                        "现行检验": self._inspection_view(self._inspections[t.检验编号]),
+                        "现行检验": (self._inspection_view(self._inspections[t.检验编号])
+                                   if t.检验编号 is not None else None),
                         "历次检验": [
                             self._inspection_view(i) for i in self._inspections.values()
                             if i.磅单编号 == t.编号
@@ -1058,6 +1496,71 @@ class HeritageCitrusService:
         if source_type == "退货":
             return self._returns[source_id].交货单编号
         return self._losses[source_id].交货单编号
+
+    # ------------------------------------------------------------------ 快照
+
+    # 具名存储 -> 元素数据类（_cares 为 deque，单独处理）
+    _SNAPSHOT_STORES = (
+        ("_plots", Plot), ("_trees", TreeGroup),
+        ("_batches", HarvestBatch), ("_tickets", WeighTicket),
+        ("_inspections", Inspection), ("_rules", PriceRule),
+        ("_contracts", Contract), ("_deliveries", Delivery),
+        ("_settlements", Settlement), ("_adjustments", GradeAdjustment),
+        ("_returns", EnterpriseReturn), ("_losses", TransitLoss),
+        ("_routes", ProcessingRoute), ("_violations", Violation),
+        ("_conflicts", TicketConflict), ("_weight_adjustments", WeightAdjustment),
+    )
+
+    def dump_state(self) -> dict:
+        """导出可 JSON 序列化的全量状态（断网/重启场景的持久化边界）。"""
+        with self._lock:
+            payload = {"seq": self._seq, "actors": [], "stores": {},
+                       "cares": [_to_primitive(c) for c in self._cares],
+                       "quotas": [], "reservations": [], "slip_index": [],
+                       "rule_versions": list(self._rule_versions),
+                       "farmer_of_plot": list(self._farmer_of_plot.items())}
+            for a in self._actors.values():
+                payload["actors"].append({"token": a.token, "name": a.name,
+                                          "role": a.role, "farmer_id": a.farmer_id})
+            for name, _cls in self._SNAPSHOT_STORES:
+                rows = []
+                for key, rec in getattr(self, name).items():
+                    rows.append([key, _to_primitive(rec)])
+                payload["stores"][name.lstrip("_")] = rows
+            for (tree_id, season), q in self._quotas.items():
+                payload["quotas"].append([tree_id, season,
+                                          {"重量": str(q["重量"]), "次数": q["次数"]}])
+            for bid, m in self._reservations.items():
+                payload["reservations"].append([bid, [[t, str(w)] for t, w in m.items()]])
+            for (bid, slip), tid in self._slip_index.items():
+                payload["slip_index"].append([bid, slip, tid])
+            return payload
+
+    @classmethod
+    def restore_state(cls, payload: dict) -> "HeritageCitrusService":
+        """从 :meth:`dump_state` 的快照恢复一个等价实例（模拟服务重启）。"""
+        svc = cls()
+        for a in payload["actors"]:
+            svc._actors[a["token"]] = Actor(**a)
+        classes = dict(cls._SNAPSHOT_STORES)
+        for name, rows in payload["stores"].items():
+            attr = "_" + name
+            model = classes[attr]
+            store = getattr(svc, attr)
+            for key, raw in rows:
+                store[key] = _from_primitive(model, raw)
+        for tree_id, season, q in payload["quotas"]:
+            svc._quotas[(tree_id, season)] = {"重量": Decimal(q["重量"]),
+                                               "次数": q["次数"]}
+        for bid, m in payload["reservations"]:
+            svc._reservations[bid] = {t: Decimal(w) for t, w in m}
+        for bid, slip, tid in payload["slip_index"]:
+            svc._slip_index[(bid, slip)] = tid
+        svc._rule_versions = deque(payload["rule_versions"])
+        svc._farmer_of_plot = dict(payload["farmer_of_plot"])
+        svc._cares = deque(_from_primitive(CareLog, c) for c in payload["cares"])
+        svc._seq = payload["seq"]
+        return svc
 
     # ------------------------------------------------------------------ 序列化视图
 
@@ -1092,10 +1595,47 @@ class HeritageCitrusService:
                 "毛重kg": str(t.毛重kg) if t.毛重kg is not None else None,
                 "皮重kg": str(t.皮重kg) if t.皮重kg is not None else None,
                 "过磅时间": t.过磅时间, "断网离线": t.断网离线, "设备号": t.设备号,
-                "同步时间": t.同步时间, "检验编号": t.检验编号, "结算编号": t.结算编号}
+                "同步时间": t.同步时间, "检验编号": t.检验编号, "结算编号": t.结算编号,
+                "业务摘要": t.业务摘要, "状态": t.状态,
+                "更正自": t.更正自, "更正为": t.更正为, "冲突编号": t.冲突编号}
         if duplicated:
             view["幂等命中"] = True
         return view
+
+    def _conflict_view(self, c: TicketConflict, masked: bool = False) -> dict:
+        view = {
+            "冲突编号": c.编号, "批次编号": c.批次编号, "过磅流水号": c.过磅流水号,
+            "农户编号": c.农户编号, "原磅单编号": c.原磅单编号,
+            "原摘要": c.原摘要[:12], "补传摘要": c.补传摘要[:12],
+            "字段差异": c.字段差异,
+            "补传净重kg": str(c.补传净重kg), "补传树群编号": c.补传树群编号,
+            "补传设备号": c.补传设备号, "补传断网离线": c.补传断网离线,
+            "补传过磅时间": c.补传过磅时间, "补传人": c.补传人,
+            "首次发现时间": c.首次发现时间, "最近补传时间": c.最近补传时间,
+            "补传次数": c.补传次数, "状态": c.状态,
+            "复核人": c.复核人, "复核时间": c.复核时间, "复核意见": c.复核意见,
+            "更正磅单编号": c.更正磅单编号,
+            # 付款/结算关联字段：仅合作社/质量复核人可见
+            "调整编号": c.调整编号,
+        }
+        if masked:
+            # 果农只看自己的冲突摘要：业务差异可见（本就是其本人数据），
+            # 但付款/结算关联（差异调整编号等财务字段）不暴露
+            for key in CONFLICT_PAYMENT_FIELDS:
+                view.pop(key, None)
+        return view
+
+    def _weight_adjustment_view(self, a: WeightAdjustment) -> dict:
+        amount = None
+        if a.结算单价 is not None:
+            amount = _money(Decimal(a.结算单价) * a.差异kg)
+        return {"重量调整编号": a.编号, "冲突编号": a.冲突编号,
+                "原磅单编号": a.原磅单编号, "批次编号": a.批次编号,
+                "农户编号": a.农户编号, "原净重kg": str(a.原净重kg),
+                "更正净重kg": str(a.更正净重kg), "差异kg": str(a.差异kg),
+                "时间": a.时间, "结算编号": a.结算编号, "状态": a.状态,
+                "结算单价": a.结算单价, "金额": amount,
+                "方向": "补付" if a.差异kg >= 0 else "扣回"}
 
     def _inspection_view(self, i: Inspection) -> dict:
         return {"检验编号": i.编号, "磅单编号": i.磅单编号, "批次编号": i.批次编号,
@@ -1128,7 +1668,9 @@ class HeritageCitrusService:
                 "合约编号": s.合约编号, "交货单编号": s.交货单编号,
                 "时间": s.时间, "状态": s.状态, "明细行": s.行,
                 "价差调整": [self._adjustment_view(self._adjustments[a])
-                            for a in s.调整编号]}
+                            for a in s.调整编号],
+                "重量调整": [self._weight_adjustment_view(self._weight_adjustments[a])
+                            for a in s.重量调整编号]}
 
     def _adjustment_view(self, a: GradeAdjustment) -> dict:
         return {"价差编号": a.编号, "原检验编号": a.原检验编号,

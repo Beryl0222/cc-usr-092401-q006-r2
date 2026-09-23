@@ -167,6 +167,165 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(body["error"], "over_reservation")
 
+    def test_replay_vs_conflict_are_distinguished_over_http(self):
+        _, batch = self.call("POST", "/batches",
+                             {"地块编号": self.plot_id, "采收日期": "2026-09-01",
+                              "季": "2026秋"}, token="coop")
+        bid = batch["批次编号"]
+        payload = {"批次编号": bid, "树群编号": self.tree_id, "过磅流水号": "W-1",
+                   "重量kg": "100", "断网离线": True, "设备号": "地磅-02"}
+        status, ticket = self.call("POST", "/weigh", payload, token="coop")
+        self.assertEqual(status, 201)
+
+        # 完全相同补传：200 幂等命中（重放）
+        status, replay = self.call("POST", "/weigh", payload, token="coop")
+        self.assertEqual(status, 201)
+        self.assertTrue(replay["幂等命中"])
+
+        # 净重被人工补录改掉：409 + 结构化冲突载荷（冲突，不是重放）
+        changed = {**payload, "重量kg": "110", "断网离线": False}
+        status, body = self.call("POST", "/weigh", changed, token="coop")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "ticket_conflict")
+        self.assertIn("冲突", body)
+        self.assertEqual(body["冲突"]["字段差异"][0]["字段"], "净重kg")
+        cid = body["冲突"]["冲突编号"]
+
+        # 磅单仍只有一张、原值未动
+        _, detail = self.call("GET", f"/batches/{bid}", token="coop")
+        self.assertEqual(len(detail["磅单"]), 1)
+        self.assertEqual(detail["磅单"][0]["重量kg"], "100")
+
+        # 非法补传不登记冲突、不占流水号
+        bad = {**payload, "过磅流水号": "W-2", "毛重kg": "10", "皮重kg": "20", "重量kg": None}
+        status, _ = self.call("POST", "/weigh", bad, token="coop")
+        self.assertEqual(status, 422)
+        status, conflicts = self.call("GET", "/conflicts?状态=待复核", token="coop")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(conflicts["记录"]), 1)
+
+        # 护树队/企业无权看冲突
+        for token in ("guard", "ent"):
+            status, denied = self.call("GET", "/conflicts", token=token)
+            self.assertEqual(status, 403)
+            self.assertEqual(denied["error"], "forbidden")
+
+        # 果农只看到自己的裁剪摘要（无付款字段）
+        status, mine = self.call("GET", "/conflicts", token="farmer")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(mine["记录"]), 1)
+        self.assertNotIn("调整编号", mine["记录"][0])
+
+        # 无权限角色不能复核
+        status, _ = self.call("POST", "/conflicts/resolve",
+                              {"冲突编号": cid, "复核结论": "保留原值"}, token="farmer")
+        self.assertEqual(status, 403)
+
+    def test_resolve_keep_then_correct_after_settlement_http(self):
+        _, batch = self.call("POST", "/batches",
+                             {"地块编号": self.plot_id, "采收日期": "2026-09-01",
+                              "季": "2026秋"}, token="coop")
+        bid = batch["批次编号"]
+        _, ticket = self.call("POST", "/weigh",
+                              {"批次编号": bid, "树群编号": self.tree_id, "过磅流水号": "W-9",
+                               "重量kg": "100", "设备号": "地磅-02"}, token="coop")
+        self.call("POST", "/inspections",
+                  {"磅单编号": ticket["磅单编号"], "等级": "A", "判定依据": "达标"},
+                  token="reviewer")
+
+        def raise_conflict(new_weight):
+            status, body = self.call("POST", "/weigh",
+                                     {"批次编号": bid, "树群编号": self.tree_id,
+                                      "过磅流水号": "W-9", "重量kg": new_weight,
+                                      "设备号": "地磅-02"}, token="coop")
+            self.assertEqual(status, 409)
+            return body["冲突"]["冲突编号"]
+
+        # 第一轮冲突：合作社保留原值
+        cid1 = raise_conflict("95")
+        status, kept = self.call("POST", "/conflicts/resolve",
+                                 {"冲突编号": cid1, "复核结论": "保留原值",
+                                  "复核意见": "纸单为准"}, token="coop")
+        self.assertEqual(status, 200)
+        self.assertEqual(kept["处置"], "保留原值")
+
+        # 交货→结算
+        _, delivery = self.call("POST", "/deliveries",
+                                {"批次编号": bid, "企业编号": "广兴饮料厂",
+                                 "合约编号": self.contract_id,
+                                 "交货时间": "2026-09-02T08:00:00+00:00"}, token="coop")
+        did = delivery["交货单编号"]
+        _, settlement = self.call("POST", "/settlements",
+                                  {"交货单编号": did}, token="coop")
+        sid = settlement["结算编号"]
+        self.assertEqual(settlement["明细行"][-1]["合计应收"], "400.00")
+
+        # 结算后再起冲突：只能形成差异调整（质量复核人处置）
+        cid2 = raise_conflict("110")
+        status, resolved = self.call("POST", "/conflicts/resolve",
+                                     {"冲突编号": cid2, "复核结论": "生成更正磅单",
+                                      "复核意见": "补录净重110"}, token="reviewer")
+        self.assertEqual(status, 200)
+        self.assertEqual(resolved["处置"], "差异调整(已结算)")
+        self.assertEqual(resolved["差异调整"]["金额"], "40.00")
+        self.assertEqual(resolved["差异调整"]["结算编号"], sid)
+
+        # 原结算不改写，重量调整独立挂账；磅单未被替换
+        _, again = self.call("GET", f"/settlements/{sid}", token="coop")
+        self.assertEqual(again["明细行"][-1]["合计应收"], "400.00")
+        self.assertEqual(again["重量调整"][0]["差异kg"], "10")
+
+        # 已解决冲突不能重复处置
+        status, body = self.call("POST", "/conflicts/resolve",
+                                 {"冲突编号": cid2, "复核结论": "保留原值"}, token="coop")
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "conflict_resolved")
+
+    def test_pre_delivery_correction_then_chain_http(self):
+        _, batch = self.call("POST", "/batches",
+                             {"地块编号": self.plot_id, "采收日期": "2026-09-01",
+                              "季": "2026秋"}, token="coop")
+        bid = batch["批次编号"]
+        _, ticket = self.call("POST", "/weigh",
+                              {"批次编号": bid, "树群编号": self.tree_id, "过磅流水号": "W-7",
+                               "重量kg": "100", "设备号": "地磅-02"}, token="coop")
+        self.call("POST", "/inspections",
+                  {"磅单编号": ticket["磅单编号"], "等级": "A", "判定依据": "达标"},
+                  token="reviewer")
+        _, body = self.call("POST", "/weigh",
+                            {"批次编号": bid, "树群编号": self.tree_id, "过磅流水号": "W-7",
+                             "重量kg": "90", "设备号": "地磅-02"}, token="coop")
+        cid = body["冲突"]["冲突编号"]
+        status, resolved = self.call("POST", "/conflicts/resolve",
+                                     {"冲突编号": cid, "复核结论": "生成更正磅单"},
+                                     token="coop")
+        self.assertEqual(status, 200)
+        new_id = resolved["更正磅单"]["磅单编号"]
+        self.assertNotEqual(new_id, ticket["磅单编号"])
+        self.assertEqual(resolved["原磅单"]["状态"], "已更正")
+
+        # 待检验冲突清空后，更正单需重新检验才能交货
+        status, blocked = self.call("POST", "/deliveries",
+                                    {"批次编号": bid, "企业编号": "广兴饮料厂",
+                                     "合约编号": self.contract_id,
+                                     "交货时间": "2026-09-02T08:00:00+00:00"}, token="coop")
+        self.assertEqual(status, 409)
+        self.assertEqual(blocked["error"], "inspection_pending")
+        self.call("POST", "/inspections",
+                  {"磅单编号": new_id, "等级": "A", "判定依据": "更正单复检"},
+                  token="reviewer")
+        _, delivery = self.call("POST", "/deliveries",
+                                {"批次编号": bid, "企业编号": "广兴饮料厂",
+                                 "合约编号": self.contract_id,
+                                 "交货时间": "2026-09-02T08:00:00+00:00"}, token="coop")
+        _, settlement = self.call("POST", "/settlements",
+                                  {"交货单编号": delivery["交货单编号"]}, token="coop")
+        # 只有更正单 90kg 进结算链
+        rows = [r for r in settlement["明细行"] if "磅单编号" in r]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["磅单编号"], new_id)
+        self.assertEqual(settlement["明细行"][-1]["合计应收"], "360.00")
+
     def test_trace_and_validation_errors(self):
         _, batch = self.call("POST", "/batches",
                              {"地块编号": self.plot_id, "采收日期": "2026-09-01",
